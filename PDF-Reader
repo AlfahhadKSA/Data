@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any
+
+import pymupdf  # PyMuPDF
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PdfTextBundle:
+    """
+    تمثل ناتج المرحلة الأولى لملف PDF واحد.
+    """
+    document_id: str
+    source_path: str
+    file_name: str
+    page_count: int
+    has_text_layer: bool
+    total_chars: int
+    page_texts: list[str]
+
+    @property
+    def full_text(self) -> str:
+        """
+        نص كامل مع فاصل صفحات واضح.
+        """
+        return "\n\f\n".join(self.page_texts)
+
+
+def make_document_id(pdf_path: Path) -> str:
+    """
+    معرف ثابت نسبيًا للملف داخل هذه القاعدة.
+    لا يعتمد على اسم الملف وحده.
+    """
+    digest = hashlib.sha1(str(pdf_path.resolve()).encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
+def extract_pdf_text_bundle(pdf_path: Path, sort_text: bool = True) -> PdfTextBundle:
+    """
+    يقرأ PDF ويستخرج النص من كل صفحة دون أي OCR.
+    """
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"File not found: {pdf_path}")
+
+    doc = None
+    try:
+        doc = pymupdf.open(str(pdf_path))
+        page_count = doc.page_count
+
+        page_texts: list[str] = []
+        for page_index in range(page_count):
+            page = doc.load_page(page_index)
+            # sort=True قد يحسن ترتيب القراءة في بعض ملفات الـPDF
+            text = page.get_text("text", sort=sort_text)
+            page_texts.append(text if text is not None else "")
+
+        total_chars = sum(len(t) for t in page_texts)
+        has_text_layer = any(t.strip() for t in page_texts)
+
+        return PdfTextBundle(
+            document_id=make_document_id(pdf_path),
+            source_path=str(pdf_path.resolve()),
+            file_name=pdf_path.name,
+            page_count=page_count,
+            has_text_layer=has_text_layer,
+            total_chars=total_chars,
+            page_texts=page_texts,
+        )
+
+    finally:
+        if doc is not None:
+            doc.close()
+
+
+def save_bundle(
+    bundle: PdfTextBundle,
+    output_text_dir: Path,
+    output_json_dir: Path,
+) -> dict[str, Any]:
+    """
+    يحفظ النص الخام + نسخة JSON للصفحات، ويرجع سجلًا مختصرًا للـ manifest.
+    """
+    output_text_dir.mkdir(parents=True, exist_ok=True)
+    output_json_dir.mkdir(parents=True, exist_ok=True)
+
+    text_path = output_text_dir / f"{bundle.document_id}.txt"
+    json_path = output_json_dir / f"{bundle.document_id}.json"
+
+    text_path.write_text(bundle.full_text, encoding="utf-8")
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(asdict(bundle), f, ensure_ascii=False, indent=2)
+
+    return {
+        "document_id": bundle.document_id,
+        "source_path": bundle.source_path,
+        "file_name": bundle.file_name,
+        "page_count": bundle.page_count,
+        "has_text_layer": bundle.has_text_layer,
+        "total_chars": bundle.total_chars,
+        "text_path": str(text_path),
+        "json_path": str(json_path),
+        "status": "ok",
+        "error_message": "",
+    }
+
+# =========================================================
+# الجزء التشغيلي المخصص لجهازك (الصقه في نهاية الملف تماماً)
+# =========================================================
+if __name__ == "__main__":
+    import os
+    import pandas as pd
+
+    # تحديد المجلد الحالي (مجلد سطح المكتب الذي يحتوي على الكود ومجلدات الشركات)
+    current_directory = Path(".")
+
+    # تحديد أين سيتم حفظ النصوص المستخرجة (سيتم إنشاؤها تلقائياً في نفس المجلد)
+    output_text_directory = current_directory / "extracted_text"
+    output_json_directory = current_directory / "extracted_json"
+
+    manifest_records = []
+
+    print("🚀 جاري بدء البحث في المجلدات الفرعية واستخراج النصوص...")
+    
+    # استخدام rglob للبحث العميق داخل مجلد كل شركة عن أي ملف PDF
+    for pdf_file in current_directory.rglob("*.pdf"):
+        # حماية للكود: تخطي أي ملفات PDF قد تكون موجودة في مجلدات المخرجات بالخطأ
+        if "extracted_text" in pdf_file.parts or "extracted_json" in pdf_file.parts:
+            continue
+            
+        print(f"📄 جاري معالجة: {pdf_file.name} (داخل مجلد: {pdf_file.parent.name})")
+        
+        try:
+            # استدعاء الدالة الأولى من كودك الأساسي
+            bundle = extract_pdf_text_bundle(pdf_file)
+            
+            # استدعاء الدالة الثانية من كودك الأساسي لحفظ الملفات
+            record = save_bundle(bundle, output_text_directory, output_json_directory)
+            
+            manifest_records.append(record)
+        except Exception as e:
+            print(f"❌ خطأ في معالجة الملف {pdf_file.name}: {e}")
+
+    # حفظ سجل العمليات النهائي في ملف Excel في المجلد الرئيسي
+    if manifest_records:
+        df = pd.DataFrame(manifest_records)
+        df.to_excel("processing_manifest.xlsx", index=False)
+        print("\n✅ تم الانتهاء بنجاح! راجع ملف Excel الناتج: processing_manifest.xlsx")
+    else:
+        print("\n⚠️ لم يتم العثور على أي ملفات PDF في المجلدات الفرعية. تأكد من امتداد الملفات (.pdf)")
