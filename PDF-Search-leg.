@@ -1,0 +1,166 @@
+import fitz
+import pandas as pd
+import re
+from tqdm import tqdm
+import time
+
+# ======================================================
+# الإعدادات
+# ======================================================
+
+PDF_FILE = "sk.pdf"
+OUTPUT = "الملف الثاني.xlsx"
+
+KEYWORDS = [
+    "صلح", "اصطلح", "تصالح", "اتفق", "تراضٍ", "بالتراضي", "تسوية", 
+    "إنهاء النزاع", "إنهاء الخصومة", "حل النزاع", "فض النزاع", 
+    "تنازل", "تنازل عن الحق", "تنازل عن الدعوى", "تنازل عن المطالبة", 
+    "أسقط حقه", "إسقاط الحق", "ترك الدعوى", "ترك المطالبة",
+    "عفو", "عفا", "عفى", "عفوت", "مسامحة", "سامح", 
+    "إسقاط الحق الخاص", "التنازل عن القصاص", "التنازل عن الشكوى", 
+    "التنازل", "اتفق الطرفان", "اصطلح الطرفان", "تم الصلح", 
+    "جرى الصلح", "ثبت الصلح", "طلب الطرفان إثبات الصلح", 
+    "أقر الطرفان بالصلح", "تنازل المدعي", "أسقط المدعي حقه", 
+    "انتهت الدعوى صلحاً"
+]
+
+# ======================================================
+# إزالة التشكيل
+# ======================================================
+
+arabic_diacritics = re.compile("""
+                             ّ|
+                             َ|
+                             ً|
+                             ُ|
+                             ٌ|
+                             ِ|
+                             ٍ|
+                             ْ|
+                             ـ
+                         """, re.VERBOSE)
+
+def normalize(text):
+    text = arabic_diacritics.sub('', text)
+    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    return text
+
+
+# ======================================================
+# إزالة المحارف غير المقبولة في Excel
+# ======================================================
+
+ILLEGAL_CHARACTERS_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F]')
+
+def clean_excel(text):
+    if not isinstance(text, str):
+        return text
+    return ILLEGAL_CHARACTERS_RE.sub("", text)
+
+
+# ======================================================
+# استخراج رقم الصفحة المطبوع
+# ======================================================
+
+def extract_printed_page(text):
+    lines = text.splitlines()
+    candidates = lines[:5] + lines[-5:]
+    
+    trans = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    
+    for line in candidates:
+        line = line.translate(trans)
+        m = re.search(r'\b\d{1,5}\b', line)
+        if m:
+            return m.group()
+            
+    return ""
+
+
+# ======================================================
+# البرنامج الرئيسي
+# ======================================================
+
+start = time.time()
+
+print("\nفتح الملف...")
+doc = fitz.open(PDF_FILE)
+
+print(f"عدد الصفحات: {len(doc)}")
+print("بدء البحث...\n")
+
+results = []
+
+for pdf_page_number, page in enumerate(tqdm(doc, desc="جاري المسح"), start=1):
+    try:
+        text = page.get_text()
+        
+        if not text.strip():
+            continue
+            
+        printed_page = extract_printed_page(text)
+        normalized = normalize(text)
+        
+        for keyword in KEYWORDS:
+            # تنظيف الكلمة/الجملة المفتاحية للبحث
+            norm_key = normalize(keyword)
+            
+            # تحويل المسافات إلى نمط يسمح بوجود أي فراغات أو أسطر جديدة بين الكلمات
+            pattern_str = re.escape(norm_key).replace(r'\ ', r'\s+')
+            matches = list(re.finditer(pattern_str, normalized))
+            
+            count = len(matches)
+            if count == 0:
+                continue
+                
+            # أخذ أول ظهور في الصفحة لاستخراج المقتطف (كما في الكود الأصلي)
+            first_match = matches[0]
+            
+            # تحديد بداية السطر (أقرب \n قبل الكلمة)
+            start_pos = normalized.rfind('\n', 0, first_match.start())
+            start_pos = 0 if start_pos == -1 else start_pos + 1
+            
+            # تحديد نهاية السطر (أقرب \n بعد الكلمة)
+            end_pos = normalized.find('\n', first_match.end())
+            end_pos = len(normalized) if end_pos == -1 else end_pos
+            
+            # استخراج السطر كاملاً
+            snippet = normalized[start_pos:end_pos].strip()
+            
+            # دمج السطرين في مسافة واحدة (لو كانت الجملة تمتد على أكثر من سطر)
+            snippet = snippet.replace("\n", " ")
+            snippet = clean_excel(snippet)
+            
+            results.append({
+                "صفحة PDF": pdf_page_number,
+                "الصفحة المطبوعة": printed_page,
+                "الكلمة": keyword,
+                "عدد مرات الظهور": count,
+                "مقتطف": snippet
+            })
+            
+    except Exception as e:
+        print(f"\nخطأ في الصفحة {pdf_page_number}: {e}")
+
+
+# ======================================================
+# حفظ النتائج
+# ======================================================
+
+df = pd.DataFrame(results)
+
+df.to_excel(
+    OUTPUT,
+    index=False,
+    engine="openpyxl"
+)
+
+elapsed = time.time() - start
+
+print("\n===================================")
+print("اكتمل البحث بنجاح")
+print("===================================")
+print(f"عدد الصفحات: {len(doc)}")
+print(f"عدد النتائج: {len(df)}")
+print(f"الوقت المستغرق: {elapsed:.1f} ثانية")
+print(f"تم حفظ النتائج في: {OUTPUT}")
