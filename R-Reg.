@@ -1,0 +1,625 @@
+# ==============================================================================
+# Master Script v6
+# تحليل شامل لرسالة الماجستير - نموذج القيمة السوقية (FVL) فقط
+# يتضمن:
+# 1) الإحصاء الوصفي
+# 2) تحليل التباين (Within / Between)
+# 3) مصفوفة الارتباط
+# 4) VIF
+# 5) اختبارات التشخيص ومفاضلة النماذج
+# 6) تقدير النموذج النهائي مع Year Dummies
+# 7) أخطاء معيارية حصينة مجمعة على مستوى الشركة
+# 8) اختبار Wald للنموذج ككل
+# 9) اختبار Wald المشترك لمتغيرات لجنة المراجعة
+# 10) تصدير جميع الجداول إلى Word
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(plm)
+  library(lmtest)
+  library(sandwich)
+  library(car)
+  library(flextable)
+  library(officer)
+})
+
+# ==============================================================================
+# 0) إعدادات عامة
+# ==============================================================================
+
+input_file  <- "data3-clean.xlsx"
+output_file <- "Ultimate_Thesis_Results_v6.docx"
+
+# خيارات التقليم (يمكن تعديلها بسهولة)
+winsorize_fvl    <- FALSE   # اجعله TRUE إذا أردت تقليم FVL
+winsorize_acmeet <- TRUE    # تقليم ACMEET حسب ما استقر عليه عملك
+winsor_lower     <- 0.01
+winsor_upper     <- 0.99
+
+# ==============================================================================
+# 1) قراءة البيانات
+# ==============================================================================
+
+data3 <- read_excel(input_file)
+
+cat("\n============================\n")
+cat("تم تحميل البيانات بنجاح\n")
+cat("============================\n")
+cat("أسماء الأعمدة:\n")
+print(names(data3))
+
+# ==============================================================================
+# 2) فحص الأعمدة الأساسية
+# ==============================================================================
+
+required_cols <- c(
+  "firm", "year", "FVL",
+  "ACSIZE", "ACIND", "ACMEET", "ACEXP", "ACNEW", "LOGSIZE"
+)
+
+missing_cols <- setdiff(required_cols, names(data3))
+
+if (length(missing_cols) > 0) {
+  stop(
+    paste(
+      "الأعمدة التالية غير موجودة في الملف:",
+      paste(missing_cols, collapse = ", ")
+    )
+  )
+}
+
+# ==============================================================================
+# 3) دالة التقليم
+# ==============================================================================
+
+my_winsorize <- function(x, lower = 0.01, upper = 0.99) {
+  limits <- quantile(x, probs = c(lower, upper), na.rm = TRUE)
+  x[x < limits[1]] <- limits[1]
+  x[x > limits[2]] <- limits[2]
+  return(x)
+}
+
+# ==============================================================================
+# 4) تطبيق التقليم حسب الإعدادات
+# ==============================================================================
+
+data3 <- data3 %>%
+  mutate(
+    FVL    = if (winsorize_fvl) my_winsorize(FVL, winsor_lower, winsor_upper) else FVL,
+    ACMEET = if (winsorize_acmeet) my_winsorize(ACMEET, winsor_lower, winsor_upper) else ACMEET
+  )
+
+cat("\n============================\n")
+cat("حالة التقليم\n")
+cat("============================\n")
+cat("FVL Winsorized   :", winsorize_fvl, "\n")
+cat("ACMEET Winsorized:", winsorize_acmeet, "\n")
+
+# ==============================================================================
+# 5) إعداد بيانات البانل
+# ==============================================================================
+
+pdata <- pdata.frame(data3, index = c("firm", "year"))
+
+# المتغيرات المستخدمة في الجداول الوصفية
+vars_to_analyze <- c("FVL", "ACSIZE", "ACIND", "ACMEET", "ACEXP", "ACNEW", "LOGSIZE")
+
+# ==============================================================================
+# 6) الإحصاء الوصفي
+# ==============================================================================
+
+desc_stat <- data3 %>%
+  select(all_of(vars_to_analyze)) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value") %>%
+  group_by(Variable) %>%
+  summarise(
+    Mean   = mean(Value, na.rm = TRUE),
+    SD     = sd(Value, na.rm = TRUE),
+    Min    = min(Value, na.rm = TRUE),
+    Q1     = quantile(Value, 0.25, na.rm = TRUE),
+    Median = median(Value, na.rm = TRUE),
+    Q3     = quantile(Value, 0.75, na.rm = TRUE),
+    Max    = max(Value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 3))) %>%
+  rename(Variable_Name = Variable)
+
+# ==============================================================================
+# 7) تحليل التباين (Overall / Between / Within)
+# ==============================================================================
+
+calc_variation <- function(var_name, df) {
+  df_clean <- df %>% filter(!is.na(.data[[var_name]]))
+  
+  overall_sd <- sd(df_clean[[var_name]], na.rm = TRUE)
+  
+  firm_means <- df_clean %>%
+    group_by(firm) %>%
+    summarise(f_mean = mean(.data[[var_name]], na.rm = TRUE), .groups = "drop")
+  
+  sd_between <- sd(firm_means$f_mean, na.rm = TRUE)
+  
+  df_clean <- df_clean %>%
+    left_join(firm_means, by = "firm") %>%
+    mutate(demeaned = .data[[var_name]] - f_mean + mean(.data[[var_name]], na.rm = TRUE))
+  
+  sd_within <- sd(df_clean$demeaned, na.rm = TRUE)
+  
+  changes <- df_clean %>%
+    group_by(firm) %>%
+    summarise(is_changed = min(.data[[var_name]], na.rm = TRUE) != max(.data[[var_name]], na.rm = TRUE),
+              .groups = "drop")
+  
+  data.frame(
+    Variable = var_name,
+    SD_Overall = round(overall_sd, 3),
+    SD_Between = round(sd_between, 3),
+    SD_Within  = round(sd_within, 3),
+    Firms_Changed   = sum(changes$is_changed, na.rm = TRUE),
+    Firms_Unchanged = sum(!changes$is_changed, na.rm = TRUE)
+  )
+}
+
+variation_table <- bind_rows(lapply(vars_to_analyze, calc_variation, df = data3))
+
+# ==============================================================================
+# 8) مصفوفة الارتباط
+# ==============================================================================
+
+cor_matrix <- cor(
+  data3 %>% select(all_of(vars_to_analyze)),
+  use = "complete.obs"
+)
+
+cor_table <- cbind(Variable = rownames(cor_matrix), as.data.frame(round(cor_matrix, 3)))
+rownames(cor_table) <- NULL
+
+# ==============================================================================
+# 9) اختبار VIF
+# ==============================================================================
+
+model_vif <- lm(FVL ~ ACSIZE + ACIND + ACMEET + ACEXP + ACNEW + LOGSIZE, data = data3)
+
+vif_values <- car::vif(model_vif)
+tolerance_values <- 1 / vif_values
+
+vif_table <- data.frame(
+  Variable = names(vif_values),
+  VIF = round(as.numeric(vif_values), 3),
+  Tolerance = round(as.numeric(tolerance_values), 3)
+)
+
+# ==============================================================================
+# 10) تعريف معادلة النموذج مع صورية السنوات
+# ==============================================================================
+
+formula_fvl <- FVL ~ ACSIZE + ACIND + ACMEET + ACEXP + ACNEW + LOGSIZE + factor(year)
+
+# ==============================================================================
+# 11) تقدير النماذج الثلاثة
+# ==============================================================================
+
+pool <- plm(formula_fvl, data = pdata, model = "pooling")
+fe   <- plm(formula_fvl, data = pdata, model = "within")
+re   <- plm(formula_fvl, data = pdata, model = "random", random.method = "swar")
+
+# ==============================================================================
+# 12) اختبارات التشخيص ومفاضلة النماذج
+# ==============================================================================
+
+f_test       <- pFtest(fe, pool)
+lm_test      <- plmtest(pool, type = "bp")
+hausman_test <- phtest(fe, re)
+bp_test      <- bptest(pool, studentize = FALSE)
+bg_test      <- pbgtest(fe)
+
+decision_text <- function(test_name, p_value) {
+  if (test_name == "F-Test") {
+    if (p_value < 0.05) {
+      return("رفض H0 وتفضيل نموذج التأثيرات الثابتة")
+    } else {
+      return("عدم رفض H0 وتفضيل النموذج التجميعي")
+    }
+  }
+  
+  if (test_name == "Breusch-Pagan LM") {
+    if (p_value < 0.05) {
+      return("رفض H0 وتفضيل نموذج التأثيرات العشوائية")
+    } else {
+      return("عدم رفض H0 وتفضيل النموذج التجميعي")
+    }
+  }
+  
+  if (test_name == "Hausman Test") {
+    if (p_value < 0.05) {
+      return("رفض H0 وتفضيل نموذج التأثيرات الثابتة")
+    } else {
+      return("عدم رفض H0 وتفضيل نموذج التأثيرات العشوائية")
+    }
+  }
+  
+  if (test_name == "Breusch-Pagan") {
+    if (p_value < 0.05) {
+      return("رفض H0 وتوجد مشكلة عدم تجانس تباين")
+    } else {
+      return("عدم رفض H0 ولا توجد مشكلة معنوية في عدم تجانس التباين")
+    }
+  }
+  
+  if (test_name == "Breusch-Godfrey") {
+    if (p_value < 0.05) {
+      return("رفض H0 وتوجد مشكلة ارتباط ذاتي")
+    } else {
+      return("عدم رفض H0 ولا توجد مشكلة ارتباط ذاتي")
+    }
+  }
+  
+  return(NA)
+}
+
+diagnostics_table <- data.frame(
+  Test = c(
+    "F-Test",
+    "Breusch-Pagan LM",
+    "Hausman Test",
+    "Breusch-Pagan",
+    "Breusch-Godfrey"
+  ),
+  Purpose = c(
+    "المفاضلة بين Pooled OLS و FE",
+    "المفاضلة بين Pooled OLS و RE",
+    "المفاضلة بين FE و RE",
+    "اختبار عدم تجانس التباين",
+    "اختبار الارتباط الذاتي"
+  ),
+  Statistic = c(
+    as.numeric(f_test$statistic),
+    as.numeric(lm_test$statistic),
+    as.numeric(hausman_test$statistic),
+    as.numeric(bp_test$statistic),
+    as.numeric(bg_test$statistic)
+  ),
+  DF = c(
+    paste(f_test$parameter, collapse = ", "),
+    paste(lm_test$parameter, collapse = ", "),
+    paste(hausman_test$parameter, collapse = ", "),
+    paste(bp_test$parameter, collapse = ", "),
+    paste(bg_test$parameter, collapse = ", ")
+  ),
+  P_value = c(
+    as.numeric(f_test$p.value),
+    as.numeric(lm_test$p.value),
+    as.numeric(hausman_test$p.value),
+    as.numeric(bp_test$p.value),
+    as.numeric(bg_test$p.value)
+  ),
+  stringsAsFactors = FALSE
+)
+
+diagnostics_table$Decision <- mapply(
+  decision_text,
+  diagnostics_table$Test,
+  diagnostics_table$P_value
+)
+
+diagnostics_table$Statistic <- round(diagnostics_table$Statistic, 3)
+diagnostics_table$P_value   <- round(diagnostics_table$P_value, 4)
+
+# ==============================================================================
+# 13) اختيار النموذج النهائي
+# ==============================================================================
+
+final_model_name <- if (hausman_test$p.value < 0.05) "FE" else "RE"
+final_estimation <- if (final_model_name == "FE") fe else re
+
+cat("\n============================\n")
+cat("النموذج النهائي المختار\n")
+cat("============================\n")
+cat("وفق اختبار Hausman، النموذج المختار هو:", final_model_name, "\n")
+
+# ==============================================================================
+# 14) الأخطاء المعيارية الحصينة المجمعة على مستوى الشركة
+# ==============================================================================
+
+robust_vcov <- vcovHC(
+  final_estimation,
+  method  = "arellano",
+  type    = "HC1",
+  cluster = "group"
+)
+
+robust_results <- coeftest(final_estimation, vcov. = robust_vcov)
+
+# ==============================================================================
+# 15) جدول معاملات النموذج النهائي
+# ==============================================================================
+
+coef_table <- data.frame(
+  Variable    = rownames(robust_results),
+  Coefficient = robust_results[, 1],
+  Std_Error   = robust_results[, 2],
+  Statistic   = robust_results[, 3],
+  P_value     = robust_results[, 4],
+  stringsAsFactors = FALSE
+)
+
+coef_table <- coef_table %>%
+  mutate(
+    Significance = case_when(
+      P_value < 0.01 ~ "***",
+      P_value < 0.05 ~ "**",
+      P_value < 0.10 ~ "*",
+      TRUE ~ ""
+    ),
+    Decision = case_when(
+      Variable %in% c("ACSIZE", "ACIND", "ACMEET", "ACEXP", "ACNEW", "LOGSIZE") & P_value < 0.05 & Coefficient > 0 ~ "يوجد أثر موجب ذو دلالة",
+      Variable %in% c("ACSIZE", "ACIND", "ACMEET", "ACEXP", "ACNEW", "LOGSIZE") & P_value < 0.05 & Coefficient < 0 ~ "يوجد أثر عكسي ذو دلالة",
+      Variable %in% c("ACSIZE", "ACIND", "ACMEET", "ACEXP", "ACNEW", "LOGSIZE") & P_value >= 0.05 ~ "لا يوجد أثر ذو دلالة",
+      TRUE ~ "-"
+    )
+  )
+
+coef_table$Coefficient <- round(coef_table$Coefficient, 4)
+coef_table$Std_Error   <- round(coef_table$Std_Error, 4)
+coef_table$Statistic   <- round(coef_table$Statistic, 4)
+coef_table$P_value     <- round(coef_table$P_value, 4)
+
+# يمكن استبعاد صورية السنوات من جدول العرض إذا رغبت
+coef_table_display <- coef_table %>%
+  filter(!grepl("factor\\(year\\)", Variable))
+
+# ==============================================================================
+# 16) إحصائيات جودة النموذج
+# ==============================================================================
+
+model_summary <- summary(final_estimation)
+
+r_sq <- NA
+adj_r_sq <- NA
+
+if (!is.null(model_summary$r.squared)) {
+  if (length(model_summary$r.squared) >= 1) {
+    r_sq <- model_summary$r.squared[1]
+  }
+  if (length(model_summary$r.squared) >= 2) {
+    adj_r_sq <- model_summary$r.squared[2]
+  }
+}
+
+wald_test_robust <- pwaldtest(final_estimation, vcov = robust_vcov)
+
+# اختبار مشترك لمتغيرات لجنة المراجعة فقط
+committee_hypotheses <- c(
+  "ACSIZE = 0",
+  "ACIND = 0",
+  "ACMEET = 0",
+  "ACEXP = 0",
+  "ACNEW = 0"
+)
+
+joint_committee_test <- car::linearHypothesis(
+  final_estimation,
+  committee_hypotheses,
+  vcov. = robust_vcov,
+  test = "Chisq"
+)
+
+joint_committee_chisq <- joint_committee_test[2, "Chisq"]
+joint_committee_pval  <- joint_committee_test[2, "Pr(>Chisq)"]
+
+n_obs   <- nobs(final_estimation)
+n_firms <- length(unique(index(final_estimation)$firm))
+n_years <- length(unique(index(final_estimation)$year))
+
+model_fit_table <- data.frame(
+  Metric = c(
+    "Final Model",
+    "Observations (N)",
+    "Number of Firms",
+    "Number of Years",
+    "R-squared",
+    "Adj. R-squared",
+    "Wald Chi-square (Model Overall)",
+    "Model P-value",
+    "Joint Wald Chi-square (Audit Committee Variables)",
+    "Joint P-value",
+    "Year Dummies Included"
+  ),
+  Value = c(
+    final_model_name,
+    n_obs,
+    n_firms,
+    n_years,
+    round(r_sq, 4),
+    round(adj_r_sq, 4),
+    round(as.numeric(wald_test_robust$statistic), 4),
+    round(as.numeric(wald_test_robust$p.value), 4),
+    round(as.numeric(joint_committee_chisq), 4),
+    round(as.numeric(joint_committee_pval), 4),
+    "Yes"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# ==============================================================================
+# 17) طباعة النتائج في الكونسول
+# ==============================================================================
+
+cat("\n============================\n")
+cat("الاختبارات التشخيصية ومفاضلة النماذج\n")
+cat("============================\n")
+print(diagnostics_table, row.names = FALSE)
+
+cat("\n============================\n")
+cat("نتائج النموذج النهائي (Robust Clustered SE)\n")
+cat("============================\n")
+print(coef_table_display, row.names = FALSE)
+
+cat("\n============================\n")
+cat("إحصائيات جودة النموذج\n")
+cat("============================\n")
+print(model_fit_table, row.names = FALSE)
+
+# ==============================================================================
+# ==============================================================================
+# 18) إنشاء جداول Word بعناوين الفصل الرابع
+# ==============================================================================
+
+ft_desc <- flextable(desc_stat) %>%
+  add_header_lines("جدول (4-1): الإحصاء الوصفي لمتغيرات الدراسة") %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all")
+
+ft_var <- flextable(variation_table) %>%
+  add_header_lines("جدول (4-2): تحليل التباين الزمني والمكاني لمتغيرات الدراسة") %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all")
+
+ft_cor <- flextable(cor_table) %>%
+  add_header_lines("جدول (4-3): مصفوفة ارتباط بيرسون لمتغيرات نموذج الدراسة") %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all")
+
+ft_vif <- flextable(vif_table) %>%
+  add_header_lines("جدول (4-4): اختبار الارتباط الخطي المتعدد (VIF و Tolerance)") %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all")
+
+ft_diag <- flextable(diagnostics_table) %>%
+  add_header_lines("جدول (4-5): اختبارات تشخيص ومفاضلة النماذج القياسية") %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all")
+
+ft_coef <- flextable(coef_table_display) %>%
+  add_header_lines("جدول (4-6): نتائج الانحدار للنموذج الأساسي للقيمة السوقية (FVL)") %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all")
+
+# جدول صغير لإحصائيات النموذج الأساسي
+model_info_table <- data.frame(
+  Item = c(
+    "النموذج المعتمد",
+    "عدد المشاهدات (N)",
+    "عدد الشركات",
+    "عدد السنوات",
+    "معامل التحديد (R-squared)",
+    "معامل التحديد المعدل (Adj. R-squared)",
+    "تضمين صورية السنوات"
+  ),
+  Value = c(
+    final_model_name,
+    n_obs,
+    n_firms,
+    n_years,
+    round(r_sq, 4),
+    round(adj_r_sq, 4),
+    "نعم"
+  ),
+  stringsAsFactors = FALSE
+)
+
+ft_model_info <- flextable(model_info_table) %>%
+  add_header_lines("جدول (4-7): إحصائيات النموذج الأساسي") %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all")
+
+# جدول Wald للفرضية الرئيسية
+wald_main_table <- data.frame(
+  Item = c("إحصائية Wald Chi-square", "القيمة الاحتمالية (P-value)", "القرار الإحصائي"),
+  Value = c(
+    round(as.numeric(wald_test_robust$statistic), 4),
+    round(as.numeric(wald_test_robust$p.value), 4),
+    ifelse(as.numeric(wald_test_robust$p.value) < 0.05,
+           "النموذج ككل دال إحصائياً",
+           "النموذج ككل غير دال إحصائياً")
+  ),
+  stringsAsFactors = FALSE
+)
+
+ft_wald_main <- flextable(wald_main_table) %>%
+  add_header_lines("جدول (4-8): اختبار الفرضية الرئيسية (الدلالة المشتركة - Wald Test)") %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all")
+
+# ==============================================================================
+# 19) تصدير ملف Word بعناوين الفصل الرابع
+# ==============================================================================
+
+doc <- read_docx() %>%
+  body_add_par("الفصل الرابع: النتائج وتحليلها ومناقشتها", style = "heading 1") %>%
+  
+  body_add_par("4-1 المقدمة", style = "heading 2") %>%
+  body_add_par(
+    "يعرض هذا الفصل نتائج التحليل الإحصائي لمتغيرات الدراسة، بدءاً من التحليل الوصفي، ثم مصفوفة الارتباط، فالاختبارات التشخيصية والمفاضلة بين النماذج القياسية، وأخيراً نتائج الانحدار للنموذج الأساسي واختبار الفرضيات الرئيسية والفرعية."
+  ) %>%
+  
+  body_add_par("4-2 نتائج التحليل الوصفي لمتغيرات الدراسة", style = "heading 2") %>%
+  
+  body_add_par("4-2-1 الإحصاء الوصفي لمتغيرات الدراسة", style = "heading 3") %>%
+  body_add_flextable(ft_desc) %>%
+  body_add_par("") %>%
+  
+  body_add_par("4-2-2 تحليل التباين الزمني والمكاني لمتغيرات الدراسة", style = "heading 3") %>%
+  body_add_flextable(ft_var) %>%
+  body_add_par("") %>%
+  
+  body_add_par("4-3 نتائج مصفوفة الارتباط لمتغيرات نموذج الدراسة", style = "heading 2") %>%
+  body_add_flextable(ft_cor) %>%
+  body_add_par("") %>%
+  
+  body_add_par("4-4 الاختبارات التشخيصية والمفاضلة للنماذج القياسية", style = "heading 2") %>%
+  
+  body_add_par("4-4-1 اختبار الارتباط الخطي المتعدد (VIF)", style = "heading 3") %>%
+  body_add_flextable(ft_vif) %>%
+  body_add_par("") %>%
+  
+  body_add_par("4-4-2 اختبارات تشخيص ومفاضلة النماذج القياسية", style = "heading 3") %>%
+  body_add_flextable(ft_diag) %>%
+  body_add_par("") %>%
+  
+  body_add_par("4-5 تحليل الانحدار الخطي المتعدد واختبار الفروض ومناقشة النتائج", style = "heading 2") %>%
+  
+  body_add_par("4-5-1 نتائج الانحدار للنموذج الأساسي (FVL)", style = "heading 3") %>%
+  body_add_flextable(ft_coef) %>%
+  body_add_par("") %>%
+  body_add_flextable(ft_model_info) %>%
+  body_add_par("") %>%
+  
+  body_add_par("4-5-2 اختبار الفرضية الرئيسية (الدلالة المشتركة - Wald Test)", style = "heading 3") %>%
+  body_add_flextable(ft_wald_main) %>%
+  body_add_par("") %>%
+  
+  body_add_par("4-5-3 اختبار الفرضيات الفرعية", style = "heading 3") %>%
+  body_add_par(
+    "يتم تفسير الفرضيات الفرعية بالاستناد إلى نتائج جدول (4-6)، وذلك من خلال فحص إشارة المعاملات واتجاهها والقيم الاحتمالية المرتبطة بكل متغير مستقل، لتحديد ما إذا كان لكل من استقلالية لجنة المراجعة، وحجمها، وخبرتها المالية، وعدد اجتماعاتها، وتنوع أعضائها أثر ذو دلالة إحصائية على القيمة السوقية للشركة."
+  ) %>%
+  body_add_par("") %>%
+  
+  body_add_par("ملاحظات منهجية", style = "heading 2") %>%
+  body_add_par(
+    paste0(
+      "1) تم تضمين متغيرات صورية للسنوات (Year Dummies) ضمن النموذج القياسي للسيطرة على التأثيرات الزمنية العامة المشتركة. ",
+      "2) تم استخدام أخطاء معيارية حصينة مجمعة على مستوى الشركة (Cluster-Robust Standard Errors). ",
+      "3) تم اختيار النموذج النهائي استناداً إلى اختبار Hausman. ",
+      "4) إعدادات التقليم الحالية: FVL = ", winsorize_fvl,
+      " ، ACMEET = ", winsorize_acmeet, "."
+    )
+  ) %>%
+  print(target = output_file)
+
+cat("\n=============================================\n")
+cat("تم إنشاء ملف Word وفق عناوين الفصل الرابع بنجاح.\n")
+cat("اسم الملف:\n")
+cat(output_file, "\n")
+cat("=============================================\n")
